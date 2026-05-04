@@ -102,6 +102,9 @@ class PlaidApiTests(APITestCase):
 
         self.assertEqual(first.status_code, status.HTTP_200_OK)
         self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertIn("transactions_fetch_window", first.data)
+        self.assertIn("lookback_days", first.data["transactions_fetch_window"])
+        self.assertIn("history_note", first.data)
         self.assertEqual(Account.objects.count(), 1)
         self.assertEqual(Transaction.objects.count(), 1)
         self.assertEqual(first.data["transactions_created"], 1)
@@ -229,6 +232,98 @@ class PlaidApiTests(APITestCase):
 
         response = self.client.get("/api/transactions")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-        self.assertEqual(float(response.data[0]["raw_amount"]), -1000.0)
-        self.assertEqual(float(response.data[0]["amount"]), 1000.0)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+        row = response.data["results"][0]
+        self.assertEqual(row["account_id"], account.id)
+        self.assertEqual(float(row["raw_amount"]), -1000.0)
+        self.assertEqual(float(row["amount"]), 1000.0)
+
+    def test_transactions_filters(self):
+        item_a = PlaidItem.objects.create(
+            item_id="item-a",
+            access_token="a",
+            institution_name="Alpha Bank",
+        )
+        item_b = PlaidItem.objects.create(
+            item_id="item-b",
+            access_token="b",
+            institution_name="Beta CU",
+        )
+        acct_a1 = Account.objects.create(
+            plaid_account_id="pa1",
+            item=item_a,
+            name="Checking",
+            account_type="depository",
+            account_subtype="checking",
+        )
+        acct_a2 = Account.objects.create(
+            plaid_account_id="pa2",
+            item=item_a,
+            name="Savings",
+            account_type="depository",
+            account_subtype="savings",
+        )
+        acct_b = Account.objects.create(
+            plaid_account_id="pb1",
+            item=item_b,
+            name="Spend",
+            account_type="depository",
+            account_subtype="checking",
+        )
+        Transaction.objects.create(
+            plaid_transaction_id="t1",
+            account=acct_a1,
+            name="Coffee Shop",
+            amount=4.5,
+            date="2026-04-01",
+            pending=False,
+            merchant_name="Joe's",
+            category_primary="FOOD_AND_DRINK",
+        )
+        Transaction.objects.create(
+            plaid_transaction_id="t2",
+            account=acct_a1,
+            name="Transfer",
+            amount=50,
+            date="2026-04-15",
+            pending=True,
+            merchant_name="",
+            category_primary="TRANSFER_IN",
+        )
+        Transaction.objects.create(
+            plaid_transaction_id="t3",
+            account=acct_a2,
+            name="Payroll",
+            amount=-2000,
+            date="2026-04-10",
+            pending=False,
+            category_primary="INCOME",
+        )
+        Transaction.objects.create(
+            plaid_transaction_id="t4",
+            account=acct_b,
+            name="Other",
+            amount=10,
+            date="2026-03-01",
+            pending=False,
+            category_primary="GENERAL",
+        )
+
+        r = self.client.get("/api/transactions", {"institution": "alpha"})
+        self.assertEqual(r.data["count"], 3)
+
+        r = self.client.get("/api/transactions", {"account_id": acct_a1.id})
+        self.assertEqual(r.data["count"], 2)
+
+        r = self.client.get("/api/transactions", {"date_from": "2026-04-10", "date_to": "2026-04-20"})
+        self.assertEqual(r.data["count"], 2)
+
+        r = self.client.get("/api/transactions", {"q": "coffee"})
+        self.assertEqual(r.data["count"], 1)
+
+        r = self.client.get("/api/transactions", {"pending": "true"})
+        self.assertEqual(r.data["count"], 1)
+
+        r = self.client.get("/api/transactions", {"category": "income"})
+        self.assertEqual(r.data["count"], 1)

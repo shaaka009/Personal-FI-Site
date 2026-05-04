@@ -1,3 +1,6 @@
+# ---- Local Cursor artifacts ----
+.cursor/
+
 # ---- Secrets / environment ----
 .env
 .env.*
@@ -48,5 +51,3 @@ pnpm-debug.log*
 *.swp
 *.swo
 
-# ---- Local Cursor artifacts ----
-.cursor/projects/

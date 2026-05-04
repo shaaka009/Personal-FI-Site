@@ -7,6 +7,7 @@ from plaid.model.item_public_token_exchange_request import (
 )
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
+from plaid.model.link_token_transactions import LinkTokenTransactions
 from plaid.model.products import Products
 from plaid.model.transactions_get_request import TransactionsGetRequest
 from plaid.model.transactions_get_request_options import TransactionsGetRequestOptions
@@ -43,6 +44,12 @@ def create_link_token() -> dict:
     )
     if settings.PLAID_REDIRECT_URI:
         request_kwargs["redirect_uri"] = settings.PLAID_REDIRECT_URI
+    # Plaid caps how much history exists for an Item at first link time (default 90 days).
+    # Must match PLAID_TRANSACTION_SYNC_LOOKBACK_DAYS; changing env alone does not deepen old Items.
+    if any(p.strip().lower() == "transactions" for p in settings.PLAID_PRODUCTS):
+        request_kwargs["transactions"] = LinkTokenTransactions(
+            days_requested=settings.PLAID_TRANSACTION_SYNC_LOOKBACK_DAYS
+        )
 
     request = LinkTokenCreateRequest(**request_kwargs)
     return client.link_token_create(request).to_dict()
@@ -60,11 +67,22 @@ def fetch_accounts(access_token: str) -> dict:
 
 
 def fetch_transactions(access_token: str, start_date, end_date) -> dict:
+    """Pull all transactions in the date range (paginates; Plaid caps count per request at 500)."""
     client = _api_client()
-    request = TransactionsGetRequest(
-        access_token=access_token,
-        start_date=start_date,
-        end_date=end_date,
-        options=TransactionsGetRequestOptions(count=250, offset=0),
-    )
-    return client.transactions_get(request).to_dict()
+    page_size = 500
+    offset = 0
+    merged: list[dict] = []
+    while True:
+        request = TransactionsGetRequest(
+            access_token=access_token,
+            start_date=start_date,
+            end_date=end_date,
+            options=TransactionsGetRequestOptions(count=page_size, offset=offset),
+        )
+        payload = client.transactions_get(request).to_dict()
+        batch = payload.get("transactions") or []
+        merged.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return {"transactions": merged}

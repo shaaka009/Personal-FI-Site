@@ -1,7 +1,9 @@
 import json
 from datetime import date, timedelta
 
+from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from plaid import ApiException
 from rest_framework import status
@@ -72,14 +74,19 @@ def plaid_exchange_token(request):
         return plaid_error_response(exc)
 
 
-def _sync_single_item(item: PlaidItem) -> tuple[int, int]:
-    """Fetch and persist accounts + transactions for one Plaid item. Returns (created, updated)."""
+def _sync_single_item(item: PlaidItem) -> tuple[int, int, int]:
+    """Fetch and persist accounts + transactions for one Plaid item.
+
+    Returns (created, updated, plaid_transaction_rows_returned).
+    """
     created = 0
     updated = 0
     accounts_payload = fetch_accounts(item.access_token)
-    start_date = date.today() - timedelta(days=90)
+    lookback = settings.PLAID_TRANSACTION_SYNC_LOOKBACK_DAYS
+    start_date = date.today() - timedelta(days=lookback)
     end_date = date.today()
     transactions_payload = fetch_transactions(item.access_token, start_date, end_date)
+    plaid_rows = transactions_payload.get("transactions") or []
 
     with transaction.atomic():
         for account_data in accounts_payload.get("accounts", []):
@@ -99,10 +106,13 @@ def _sync_single_item(item: PlaidItem) -> tuple[int, int]:
                 },
             )
 
-        for txn in transactions_payload.get("transactions", []):
+        for txn in plaid_rows:
             account = Account.objects.filter(plaid_account_id=txn["account_id"]).first()
             if not account:
                 continue
+            pfc = txn.get("personal_finance_category")
+            if not isinstance(pfc, dict):
+                pfc = {}
             _, was_created = Transaction.objects.update_or_create(
                 plaid_transaction_id=txn["transaction_id"],
                 defaults={
@@ -112,12 +122,8 @@ def _sync_single_item(item: PlaidItem) -> tuple[int, int]:
                     "date": txn.get("date"),
                     "pending": txn.get("pending", False),
                     "merchant_name": txn.get("merchant_name", "") or "",
-                    "category_primary": (
-                        txn.get("personal_finance_category", {}).get("primary", "")
-                    ),
-                    "category_detailed": (
-                        txn.get("personal_finance_category", {}).get("detailed", "")
-                    ),
+                    "category_primary": pfc.get("primary", "") or "",
+                    "category_detailed": pfc.get("detailed", "") or "",
                     "payment_channel": txn.get("payment_channel", "") or "",
                     "authorized_date": txn.get("authorized_date"),
                 },
@@ -126,7 +132,7 @@ def _sync_single_item(item: PlaidItem) -> tuple[int, int]:
                 created += 1
             else:
                 updated += 1
-    return created, updated
+    return created, updated, len(plaid_rows)
 
 
 @api_view(["POST"])
@@ -140,14 +146,19 @@ def plaid_sync(request):
 
     total_transactions_created = 0
     total_transactions_updated = 0
+    total_plaid_transaction_rows = 0
     items_failed: list[dict] = []
     items_succeeded = 0
+    lookback = settings.PLAID_TRANSACTION_SYNC_LOOKBACK_DAYS
+    window_start = date.today() - timedelta(days=lookback)
+    window_end = date.today()
 
     for item in items:
         try:
-            c, u = _sync_single_item(item)
+            c, u, n = _sync_single_item(item)
             total_transactions_created += c
             total_transactions_updated += u
+            total_plaid_transaction_rows += n
             now = timezone.now()
             item.last_sync_at = now
             item.last_sync_success = True
@@ -191,6 +202,18 @@ def plaid_sync(request):
         "transactions_updated": total_transactions_updated,
         "items_succeeded": items_succeeded,
         "items_failed": items_failed,
+        "transactions_fetch_window": {
+            "start_date": window_start.isoformat(),
+            "end_date": window_end.isoformat(),
+            "lookback_days": lookback,
+        },
+        "plaid_transaction_rows_fetched": total_plaid_transaction_rows,
+        "history_note": (
+            "Plaid stores only as much history as was requested the first time that bank was linked "
+            f"(`transactions.days_requested`, currently {lookback} days from this app). "
+            "If you already linked before raising that value, disconnect the institution and run "
+            "Connect Institution again so Plaid can pull a deeper window."
+        ),
     }
 
     if items_succeeded == 0:
@@ -237,15 +260,79 @@ def accounts_list(request):
     return Response(payload)
 
 
+def _parse_transactions_limit(raw: str | None) -> tuple[int | None, Response | None]:
+    if raw is None or raw == "":
+        return 500, None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None, Response({"error": "Invalid limit"}, status=status.HTTP_400_BAD_REQUEST)
+    if n < 1:
+        return None, Response({"error": "limit must be at least 1"}, status=status.HTTP_400_BAD_REQUEST)
+    return min(n, 2000), None
+
+
 @api_view(["GET"])
 def transactions_list(request):
-    transactions = (
-        Transaction.objects.select_related("account", "account__item").all()[:200]
-    )
+    qs = Transaction.objects.select_related("account", "account__item").all()
+
+    date_from = request.query_params.get("date_from")
+    if date_from:
+        try:
+            qs = qs.filter(date__gte=date.fromisoformat(date_from))
+        except ValueError:
+            return Response({"error": "Invalid date_from"}, status=status.HTTP_400_BAD_REQUEST)
+
+    date_to = request.query_params.get("date_to")
+    if date_to:
+        try:
+            qs = qs.filter(date__lte=date.fromisoformat(date_to))
+        except ValueError:
+            return Response({"error": "Invalid date_to"}, status=status.HTTP_400_BAD_REQUEST)
+
+    account_id = request.query_params.get("account_id")
+    if account_id is not None and account_id != "":
+        if not str(account_id).isdigit():
+            return Response({"error": "Invalid account_id"}, status=status.HTTP_400_BAD_REQUEST)
+        qs = qs.filter(account_id=int(account_id))
+
+    institution = (request.query_params.get("institution") or "").strip()
+    if institution:
+        qs = qs.filter(account__item__institution_name__icontains=institution)
+
+    category = (request.query_params.get("category") or "").strip()
+    if category:
+        qs = qs.filter(
+            Q(category_primary__icontains=category)
+            | Q(category_detailed__icontains=category)
+        )
+
+    q = (request.query_params.get("q") or "").strip()
+    if q:
+        qs = qs.filter(Q(name__icontains=q) | Q(merchant_name__icontains=q))
+
+    pending_raw = request.query_params.get("pending")
+    if pending_raw is not None and pending_raw != "":
+        key = pending_raw.lower()
+        if key in ("true", "1", "yes"):
+            qs = qs.filter(pending=True)
+        elif key in ("false", "0", "no"):
+            qs = qs.filter(pending=False)
+        else:
+            return Response({"error": "Invalid pending"}, status=status.HTTP_400_BAD_REQUEST)
+
+    limit_n, err = _parse_transactions_limit(request.query_params.get("limit"))
+    if err:
+        return err
+
+    ordered = qs.order_by("-date", "-updated_at")
+    total = ordered.count()
+    slice_qs = ordered[:limit_n]
     payload = [
         {
             "id": txn.id,
             "transaction_id": txn.plaid_transaction_id,
+            "account_id": txn.account_id,
             "institution": txn.account.item.institution_name,
             "account_name": txn.account.name,
             "name": txn.name,
@@ -257,6 +344,6 @@ def transactions_list(request):
             "category_primary": txn.category_primary,
             "category_detailed": txn.category_detailed,
         }
-        for txn in transactions
+        for txn in slice_qs
     ]
-    return Response(payload)
+    return Response({"results": payload, "count": total})

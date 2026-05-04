@@ -103,3 +103,10 @@ PLAID_COUNTRY_CODES = [
     if country.strip()
 ]
 PLAID_REDIRECT_URI = os.getenv("PLAID_REDIRECT_URI", "")
+_raw_lookback = os.getenv("PLAID_TRANSACTION_SYNC_LOOKBACK_DAYS", "365")
+try:
+    _lookback_days = int(_raw_lookback)
+except ValueError:
+    _lookback_days = 365
+# Plaid /transactions/get supports up to ~730 days of history for many institutions.
+PLAID_TRANSACTION_SYNC_LOOKBACK_DAYS = max(1, min(_lookback_days, 730))

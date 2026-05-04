@@ -58,6 +58,17 @@ export function getAccounts() {
   return request("/accounts");
 }
 
-export function getTransactions() {
-  return request("/transactions");
+/**
+ * @param {Record<string, string | number | boolean | undefined | null>} [params]
+ */
+export function getTransactions(params) {
+  const search = new URLSearchParams();
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null || value === "") continue;
+      search.set(key, String(value));
+    }
+  }
+  const qs = search.toString();
+  return request(`/transactions${qs ? `?${qs}` : ""}`);
 }
